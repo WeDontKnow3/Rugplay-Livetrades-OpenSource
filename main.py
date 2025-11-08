@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import threading
 import requests
 import datetime
 from typing import Any,Dict,List,Optional,Tuple
@@ -23,10 +24,14 @@ MIN_USD=Decimal(os.getenv('MIN_USD','0')or'0')
 COOKIE_STR=os.getenv('RUGPLAY_COOKIE','').strip()
 if not COOKIE_STR and os.path.exists('cookie.txt'):
 	with open('cookie.txt','r',encoding='utf-8')as f:COOKIE_STR=f.read().strip()
-API_URL='https://rugplay.com/api/trades/recent'
-RUGPLAY_BASE='https://rugplay.com'
+API_URL=os.getenv('API_URL','https://rugplay.com/api/trades/recent')
+RUGPLAY_BASE=os.getenv('RUGPLAY_BASE','https://rugplay.com')
+WEBSOCKET_URL=os.getenv('WEBSOCKET_URL','wss://ws.rugplay.com/')
+WEBSOCKET_USERID=os.getenv('WEBSOCKET_USERID','8351')
+WEBSOCKET_COIN=os.getenv('WEBSOCKET_COIN','@global')
+AUTO_SUBSCRIBE=os.getenv('AUTO_SUBSCRIBE','true').lower()in('1','true','yes')
 session=requests.Session()
-session.headers.update({'accept':'*/*','accept-language':'pt-BR','referer':'https://rugplay.com/live','sec-ch-ua':'"Chromium";v="127", "Not)A;Brand";v="99", "Microsoft Edge Simulate";v="127", "Lemur";v="127"','sec-ch-ua-mobile':'?0','sec-ch-ua-platform':'"Android"','sec-fetch-dest':'empty','sec-fetch-mode':'cors','sec-fetch-site':'same-origin','user-agent':'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36'})
+session.headers.update({'accept':'*/*','accept-language':'pt-BR','referer':f"{RUGPLAY_BASE.rstrip("/")}/live",'user-agent':'RugPlayMonitor/1.0'})
 if COOKIE_STR:
 	for item in[c.strip()for c in COOKIE_STR.split(';')if c.strip()]:
 		if'='in item:k,v=item.split('=',1);session.cookies.set(k.strip(),v.strip())
@@ -86,11 +91,9 @@ def normalize_ts(ts):
 		if t>10**9:return t*1000
 		return t
 	except Exception:return 0
-def parse_response_json(r):
-	try:data=r.json()
-	except Exception:
-		try:data=json.loads(r.text)
-		except Exception:return[]
+def parse_response_json(r_text):
+	try:data=json.loads(r_text)
+	except Exception:return[]
 	if isinstance(data,dict):
 		if'trades'in data and isinstance(data['trades'],list):return data['trades']
 		if'data'in data and isinstance(data['data'],list):return data['data']
@@ -99,21 +102,6 @@ def parse_response_json(r):
 		return[]
 	elif isinstance(data,list):return data
 	return[]
-def fetch_trades(limit=LIMIT):
-	params={'limit':limit}
-	try:r=session.get(API_URL,params=params,timeout=15)
-	except Exception as e:print('Request error:',e);return[]
-	if r.status_code!=200:print(f"Bad status {r.status_code} from trades endpoint. Preview: {r.text[:300]}");return[]
-	trades=parse_response_json(r);parsed=[]
-	for t in trades:
-		if isinstance(t,dict):parsed.append(t)
-		elif isinstance(t,str):
-			try:parsed.append(json.loads(t))
-			except Exception:continue
-	return parsed
-def ts_to_iso(ms_ts):
-	try:return datetime.datetime.utcfromtimestamp(ms_ts/1e3).isoformat()+'Z'
-	except Exception:return datetime.datetime.utcnow().isoformat()+'Z'
 def detect_side(item):
 	side_raw=safe_get(item,['type','side','action'],'')
 	if isinstance(side_raw,str):
@@ -162,15 +150,70 @@ def build_embed_from_item(item,buy_count,sell_count):
 	embed['footer']={'text':f"RugPlay Live • {symbol}",'icon_url':f"{RUGPLAY_BASE.rstrip("/")}/favicon.ico"};return embed,ts_ms
 def send_discord_embed(embed):
 	if not DISCORD_WEBHOOK:print('DISCORD_WEBHOOK not set - preview embed:');print(json.dumps(embed,indent=2,ensure_ascii=False)[:1000]);return
-	payload={'username':'🎯 RugPlay Monitor','avatar_url':'https://rugplay.com/favicon.ico','embeds':[embed]}
+	payload={'username':'🎯 RugPlay Monitor','avatar_url':f"{RUGPLAY_BASE.rstrip("/")}/favicon.ico",'embeds':[embed]}
 	try:
 		r=requests.post(DISCORD_WEBHOOK,json=payload,timeout=10)
 		if r.status_code not in(200,204):print('Discord webhook failed:',r.status_code,r.text[:300])
 	except Exception as e:print('Error sending webhook:',e)
-def main():
-	start_ms=int(time.time()*1000);last_seen=start_ms;print(f"🚀 Notifier started at {start_ms} ms. Ignoring prior trades.");buy_count=0;sell_count=0
+lock=threading.Lock()
+buy_count=0
+sell_count=0
+last_seen=int(time.time()*1000)
+def process_trade(item):
+	global buy_count,sell_count,last_seen;ts=normalize_ts(safe_get(item,['timestamp','time','createdAt'],None))
+	with lock:
+		if ts<=last_seen:return
+		symbol=(safe_get(item,['coinSymbol','symbol'],'')or'').upper();usd_dec=to_decimal_safe(safe_get(item,['totalValue','total_value','valueUsd','usd','total'],None))
+		if COIN_FILTER and symbol and COIN_FILTER!=symbol:last_seen=max(last_seen,ts);return
+		if MIN_USD and(usd_dec is None or usd_dec<MIN_USD):last_seen=max(last_seen,ts);return
+		side=detect_side(item)
+		if side=='buy':buy_count+=1
+		elif side=='sell':sell_count+=1
+		embed,ts_ms=build_embed_from_item(item,buy_count,sell_count);send_discord_embed(embed);action_emoji='🚀'if side=='buy'else'💎'if side=='sell'else'🔔';print(f"{action_emoji} Notified: {symbol or"UNKNOWN"} @ {ts_ms}  (B:{buy_count}, S:{sell_count})");last_seen=max(last_seen,ts_ms)
+def start_websocket_client():
+	try:from websocket import WebSocketApp
+	except Exception:print('websocket-client is required for WebSocket mode. Install with: pip install websocket-client');return
+	headers=[];headers.append(f"Origin: {RUGPLAY_BASE.rstrip("/")}");headers.append(f"User-Agent: {session.headers.get("user-agent")}")
+	if COOKIE_STR:headers.append(f"Cookie: {COOKIE_STR}")
+	def on_message(ws,message):
+		try:payload=json.loads(message)
+		except Exception:return
+		if isinstance(payload,dict)and payload.get('type')=='ping':
+			try:ws.send(json.dumps({'type':'pong'}))
+			except Exception:pass
+			return
+		if isinstance(payload,dict)and payload.get('type')in('all-trades','trade','trade:update'):data=payload.get('data')if isinstance(payload.get('data'),dict)else payload;process_trade(data);return
+		trades=[]
+		if isinstance(payload,dict):
+			if'trades'in payload and isinstance(payload['trades'],list):trades=payload['trades']
+			elif'data'in payload and isinstance(payload['data'],list):trades=payload['data']
+			elif'data'in payload and isinstance(payload['data'],dict)and payload.get('type')in('all-trades','trade'):process_trade(payload['data']);return
+		elif isinstance(payload,list):trades=payload
+		for t in trades:
+			if isinstance(t,dict):process_trade(t)
+	def on_open(ws):
+		print('WebSocket connected; sending init messages...')
+		try:
+			ws.send(json.dumps({'type':'set_user','userId':WEBSOCKET_USERID}));ws.send(json.dumps({'type':'set_coin','coinSymbol':WEBSOCKET_COIN}))
+			if AUTO_SUBSCRIBE:ws.send(json.dumps({'type':'subscribe','channel':'trades:all'}))
+		except Exception as e:print('Error sending init messages:',e)
+	def on_close(ws,close_status_code,close_msg):print('WebSocket closed.',close_status_code,close_msg)
+	def on_error(ws,error):print('WebSocket error:',error)
+	backoff=1
 	while True:
-		trades=fetch_trades(LIMIT)
+		try:print(f"Connecting to WebSocket: {WEBSOCKET_URL}");ws=WebSocketApp(WEBSOCKET_URL,on_message=on_message,on_open=on_open,on_close=on_close,on_error=on_error,header=headers if headers else None);ws.run_forever(ping_interval=20,ping_timeout=10)
+		except Exception as e:print('WebSocket client exception:',e)
+		print(f"Reconnecting in {backoff}s...");time.sleep(backoff);backoff=min(backoff*2,60)
+def fetch_trades_http(limit=LIMIT):
+	params={'limit':limit}
+	try:r=session.get(API_URL,params=params,timeout=15)
+	except Exception as e:print('Request error:',e);return[]
+	if r.status_code!=200:print(f"Bad status {r.status_code} from trades endpoint. Preview: {r.text[:300]}");return[]
+	return parse_response_json(r.text)
+def start_http_poller():
+	global last_seen;print('Starting HTTP poller.')
+	while True:
+		trades=fetch_trades_http(LIMIT)
 		if not trades:print('⏳ No trades returned from endpoint.');time.sleep(POLL_INTERVAL);continue
 		new_items=[]
 		for t in trades:
@@ -179,14 +222,11 @@ def main():
 			if ts>last_seen:new_items.append((ts,t))
 		if new_items:
 			new_items.sort(key=lambda x:x[0])
-			for(ts,item)in new_items:
-				symbol=(safe_get(item,['coinSymbol','symbol'],'')or'').upper();usd_dec=to_decimal_safe(safe_get(item,['totalValue','total_value','valueUsd','usd','total'],None))
-				if COIN_FILTER and symbol and COIN_FILTER!=symbol:last_seen=max(last_seen,ts);continue
-				if MIN_USD and(usd_dec is None or usd_dec<MIN_USD):last_seen=max(last_seen,ts);continue
-				side=detect_side(item)
-				if side=='buy':buy_count+=1
-				elif side=='sell':sell_count+=1
-				embed,ts_ms=build_embed_from_item(item,buy_count,sell_count);send_discord_embed(embed);action_emoji='🚀'if side=='buy'else'💎';print(f"{action_emoji} Notified: {symbol} @ {ts_ms}  (B:{buy_count}, S:{sell_count})");last_seen=max(last_seen,ts_ms)
+			for(ts,item)in new_items:process_trade(item)
 		else:print('💤 No new trades.')
 		time.sleep(POLL_INTERVAL)
+def main():
+	print('RugPlay real-time monitor starting.');global last_seen;last_seen=int(time.time()*1000)
+	if WEBSOCKET_URL:start_websocket_client()
+	else:print('Starting HTTP poller.');start_http_poller()
 if __name__=='__main__':main()
